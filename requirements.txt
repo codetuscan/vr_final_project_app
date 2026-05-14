@@ -2,3 +2,9 @@ streamlit
 pillow
 numpy
 hnswlib
+python-dotenv
+torch
+open-clip-torch
+transformers
+accelerate
+ultralytics

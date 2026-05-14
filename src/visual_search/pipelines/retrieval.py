@@ -1,7 +1,16 @@
-"""Retrieval pipeline for query-by-image search."""
+"""Retrieval pipeline for query-by-image search.
+
+Matches the Condition C pipeline from c-abilation-p.ipynb:
+  1. Fine-tuned CLIP encodes query image
+  2. HNSW index retrieves top-K candidates via fused embeddings
+  3. BLIP ITM re-ranks candidates using image-text matching
+
+Includes embedding caching so the index only needs to be built once.
+"""
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -21,6 +30,7 @@ class RetrievalResult:
     image_path: str
     caption: str
     category: str
+    itm_score: float = 0.0
 
 
 class RetrievalPipeline:
@@ -30,6 +40,7 @@ class RetrievalPipeline:
         index: VectorIndex,
         reranker: Reranker,
         alpha: float = 0.5,
+        cache_dir: str = "",
     ) -> None:
         self.embedder = embedder
         self.index = index
@@ -37,50 +48,133 @@ class RetrievalPipeline:
         self.alpha = alpha
         self.records: list = []
         self.missing_images = 0
+        self.cache_dir = Path(cache_dir) if cache_dir else None
 
-    def _load_image(self, path_str: str) -> Image.Image:
-        path = Path(path_str)
-        if not path.exists():
-            self.missing_images += 1
-            return Image.new("RGB", (224, 224), color=(0, 0, 0))
-        try:
-            return ensure_rgb(Image.open(path))
-        except OSError:
-            self.missing_images += 1
-            return Image.new("RGB", (224, 224), color=(0, 0, 0))
+    def _cache_path(self, n_records: int) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        tag = f"{self.embedder.name}_a{self.alpha}_{n_records}"
+        h = hashlib.md5(tag.encode()).hexdigest()[:12]
+        return self.cache_dir / f"gallery_emb_{h}.npy"
 
-    def build_index(self, records: Iterable) -> None:
-        vectors: list[np.ndarray] = []
-        self.records = []
+    def build_index(self, records: Iterable, progress_callback=None) -> None:
+        """Build the HNSW index from gallery records.
+
+        Uses batched CLIP encoding for speed. Caches embeddings to disk.
+        """
+        self.records = list(records)
         self.missing_images = 0
+        n = len(self.records)
 
-        for record in records:
-            image = self._load_image(getattr(record, "image_path"))
+        # Try loading cached embeddings
+        cp = self._cache_path(n)
+        if cp and cp.exists():
+            matrix = np.load(str(cp))
+            if len(matrix) == n:
+                self.index.build(matrix)
+                if progress_callback:
+                    progress_callback(1.0, f"Loaded cached index ({n:,} items)")
+                return
+
+        dim = self.embedder.dim
+        has_batch = hasattr(self.embedder, "embed_images_batch")
+
+        # --- Collect all images and captions ---
+        if progress_callback:
+            progress_callback(0.0, "Loading gallery images…")
+
+        images: list[Image.Image] = []
+        captions: list[str] = []
+        img_valid: list[bool] = []
+
+        for i, record in enumerate(self.records):
             caption = getattr(record, "caption", "") or ""
-            img_vec = self.embedder.embed_image(image)
-            if caption:
-                txt_vec = self.embedder.embed_text(caption)
+            captions.append(caption)
+            img_path = getattr(record, "image_path", "")
+            if img_path and Path(img_path).exists():
+                try:
+                    images.append(ensure_rgb(Image.open(img_path)))
+                    img_valid.append(True)
+                except OSError:
+                    images.append(Image.new("RGB", (224, 224)))
+                    img_valid.append(False)
+                    self.missing_images += 1
             else:
-                txt_vec = np.zeros(self.embedder.dim, dtype=np.float32)
-            fused = self.alpha * img_vec + (1.0 - self.alpha) * txt_vec
-            vectors.append(normalize_vector(fused))
-            self.records.append(record)
+                images.append(Image.new("RGB", (224, 224)))
+                img_valid.append(False)
+                if img_path:
+                    self.missing_images += 1
 
-        if vectors:
-            matrix = np.vstack(vectors).astype(np.float32)
-            self.index.build(matrix)
+        # --- Batch encode images ---
+        if progress_callback:
+            progress_callback(0.1, f"Encoding {n:,} images (batched)…")
+
+        if has_batch:
+            img_matrix = self.embedder.embed_images_batch(images, batch_size=64)
+        else:
+            vecs = []
+            for i, img in enumerate(images):
+                vecs.append(self.embedder.embed_image(img))
+                if progress_callback and i % 200 == 0:
+                    progress_callback(0.1 + 0.5 * i / n, f"Encoding images ({i:,}/{n:,})…")
+            img_matrix = np.vstack(vecs)
+
+        if progress_callback:
+            progress_callback(0.6, f"Encoding {n:,} captions (batched)…")
+
+        # --- Batch encode captions ---
+        non_empty = [c for c in captions if c.strip()]
+        if has_batch and non_empty:
+            txt_matrix = self.embedder.embed_texts_batch(captions, batch_size=128)
+        else:
+            tvecs = []
+            for c in captions:
+                if c.strip():
+                    tvecs.append(self.embedder.embed_text(c))
+                else:
+                    tvecs.append(np.zeros(dim, dtype=np.float32))
+            txt_matrix = np.vstack(tvecs)
+
+        if progress_callback:
+            progress_callback(0.9, "Fusing embeddings & building index…")
+
+        # --- Fuse ---
+        fused = np.zeros_like(img_matrix)
+        for i in range(n):
+            if img_valid[i]:
+                fused[i] = self.alpha * img_matrix[i] + (1.0 - self.alpha) * txt_matrix[i]
+            else:
+                fused[i] = txt_matrix[i]
+
+        norms = np.linalg.norm(fused, axis=1, keepdims=True).clip(min=1e-8)
+        matrix = (fused / norms).astype(np.float32)
+
+        self.index.build(matrix)
+        if cp:
+            np.save(str(cp), matrix)
+
+        if progress_callback:
+            progress_callback(1.0, f"Index built ({n:,} items)")
+
 
     def search(self, query_image: Image.Image, top_k: int) -> list[RetrievalResult]:
+        """Run the full retrieval pipeline:
+
+        1. Encode query image with fine-tuned CLIP
+        2. HNSW nearest-neighbor search
+        3. BLIP ITM re-ranking on top-K candidates
+        """
         if not self.records:
             return []
 
         query_vec = self.embedder.embed_image(query_image)
         hits = self.index.search(query_vec, top_k)
-        results: list[dict] = []
+        candidates: list[dict] = []
 
         for idx, score in hits:
             record = self.records[idx]
-            results.append(
+            candidates.append(
                 {
                     "rank": 0,
                     "score": score,
@@ -91,9 +185,11 @@ class RetrievalPipeline:
                 }
             )
 
-        results = self.reranker.rerank(query_image, results)
+        # BLIP ITM re-ranking (matches notebook's online query flow)
+        candidates = self.reranker.rerank(query_image, candidates)
+
         final: list[RetrievalResult] = []
-        for rank, item in enumerate(results, start=1):
+        for rank, item in enumerate(candidates, start=1):
             final.append(
                 RetrievalResult(
                     rank=rank,
@@ -102,6 +198,7 @@ class RetrievalPipeline:
                     image_path=str(item.get("image_path", "")),
                     caption=str(item.get("caption", "")),
                     category=str(item.get("category", "")),
+                    itm_score=float(item.get("itm_score", 0.0)),
                 )
             )
         return final

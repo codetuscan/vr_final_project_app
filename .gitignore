@@ -160,6 +160,7 @@ Thumbs.db
 data/
 *.pt
 *.pkl
+*.jpg
 index_backup/
 archive/
 archive.zip
