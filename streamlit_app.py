@@ -290,7 +290,11 @@ if original_image is None:
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("## ② Detection & Preview")
 
-conf_threshold = st.slider("Detection Confidence Threshold", 0.0, 1.0, 0.5, 0.05)
+conf_threshold = st.slider(
+    "Detection Confidence Threshold", 0.0, 1.0, 0.10, 0.05,
+    help="Low default (0.10) avoids missing genuine multi-garment images. "
+         "Cross-class NMS (IoU > 0.60) automatically removes redundant overlapping crops.",
+)
 
 if "crop_results" not in st.session_state or st.session_state.get("last_threshold") != conf_threshold:
     with st.spinner("Running YOLO detection…"):
