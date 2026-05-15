@@ -158,7 +158,7 @@ Thumbs.db
 
 # Project Specific (Data & Weights)
 data/
-*.pt
+
 *.pkl
 *.jpg
 index_backup/
