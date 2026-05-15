@@ -4,6 +4,14 @@
 Runs YOLO crop -> BLIP-2 captions -> CLIP embeddings -> fusion -> HNSW search,
 with optional BLIP-ITM reranking. Computes Recall@K, mAP@K, NDCG@K and
 exports a qualitative top-5 grid for 3 queries.
+
+This file is written to be self-auditable:
+    - YOLO (ultralytics) is used ONLY for detection/cropping (pre-processing).
+    - BLIP-2 is used ONLY to generate natural-language captions (optional).
+    - CLIP is used ONLY to embed images/text into a shared vector space.
+    - Fusion mixes image+text embeddings via alpha.
+    - HNSW (hnswlib) performs approximate nearest-neighbor retrieval.
+    - BLIP-ITM reranks top-K candidates via image-text matching (optional).
 """
 
 from __future__ import annotations
@@ -200,6 +208,19 @@ def load_image(path: str, size: Tuple[int, int] | None = None) -> Image.Image:
 
 
 def yolo_crop_batch(model, img_paths: List[str], crop_dir: Path, pad: int, device: str) -> List[str]:
+        """Run YOLO detection and cache crops on disk.
+
+        Model used here:
+            - YOLO (ultralytics) object detector
+
+        Purpose:
+            - Localize the clothing region and crop it before embedding.
+            - This reduces background noise for CLIP retrieval.
+
+        Behavior:
+            - If YOLO is disabled/unavailable, this becomes a no-op and saves full images.
+            - Crops are cached by image-path hash to avoid repeated YOLO inference.
+        """
     out_paths = [str(crop_cache_path(p, crop_dir)) for p in img_paths]
     to_process = [(p, out) for p, out in zip(img_paths, out_paths) if not Path(out).exists()]
     if not to_process:
@@ -211,11 +232,14 @@ def yolo_crop_batch(model, img_paths: List[str], crop_dir: Path, pad: int, devic
             img.save(out_path)
         return out_paths
 
+    # YOLO inference call (ultralytics): produces bounding boxes per image.
     results = model.predict([p for p, _ in to_process], device=device, verbose=False)
     for (img_path, out_path), result in zip(to_process, results):
         img = load_image(img_path)
         boxes = getattr(result, "boxes", None)
         if boxes is not None and len(boxes) > 0:
+            # Heuristic for this batch-eval script: pick the *largest area* box.
+            # (The Streamlit app implements cross-class NMS; this script keeps it simple.)
             areas = (boxes.xyxy[:, 2] - boxes.xyxy[:, 0]) * (boxes.xyxy[:, 3] - boxes.xyxy[:, 1])
             best_idx = int(areas.argmax())
             best = boxes[best_idx]
@@ -233,6 +257,14 @@ def yolo_crop_batch(model, img_paths: List[str], crop_dir: Path, pad: int, devic
 
 
 def load_yolo(weights: str, device: str):
+        """Load the YOLO detector (ultralytics) used for cropping.
+
+        Model used:
+            - YOLO weights fine-tuned for garment localization.
+
+        Returns:
+            - A YOLO model instance, or None if weights/dependencies are missing.
+        """
     if not weights:
         return None
     if not Path(weights).exists():
@@ -245,6 +277,15 @@ def load_yolo(weights: str, device: str):
 
 
 def load_blip2(model_name: str, device: str):
+        """Load BLIP-2 captioning model.
+
+        Model used here:
+            - BLIP-2 (Salesforce/blip2-*) image-to-text generator
+
+        Purpose:
+            - Generate a short caption describing the clothing item.
+            - Captions are embedded by CLIP text encoder for fusion.
+        """
     try:
         from transformers import Blip2Processor, Blip2ForConditionalGeneration
     except ImportError as exc:
@@ -263,6 +304,14 @@ def load_blip2(model_name: str, device: str):
 
 
 def caption_batch(processor, model, img_paths: List[str], batch_size: int, device: str, max_tokens: int) -> List[str]:
+        """Generate captions in batches using BLIP-2.
+
+        Model call:
+            - model.generate(...) (BLIP-2) to produce text tokens
+
+        Output:
+            - List of caption strings aligned with img_paths.
+        """
     captions: List[str] = []
     for i in range(0, len(img_paths), batch_size):
         batch = img_paths[i : i + batch_size]
@@ -282,6 +331,15 @@ def caption_batch(processor, model, img_paths: List[str], batch_size: int, devic
 
 
 def load_itm(model_name: str, device: str):
+        """Load BLIP Image-Text Matching (ITM) model used for reranking.
+
+        Model used:
+            - BLIP-ITM (Salesforce/blip-itm-base-coco)
+
+        Purpose:
+            - Given a query image and a candidate caption, produce an ITM score.
+            - Used to rerank retrieved candidates.
+        """
     try:
         from transformers import BlipProcessor, BlipForImageTextRetrieval
     except ImportError as exc:
@@ -298,6 +356,19 @@ def load_itm(model_name: str, device: str):
 
 
 def itm_rerank(proc, model, query_path: str, candidates: List[int], meta: List[CatalogRecord], device: str) -> List[int]:
+        """Rerank candidate indices using BLIP-ITM scores.
+
+        Model call:
+            - BlipForImageTextRetrieval(..., use_itm_head=True)
+
+        Inputs:
+            - query_path: query crop path (output of YOLO cropping step)
+            - candidates: indices of retrieved gallery items (from HNSW/brute-force)
+            - meta: catalog records (must include captions)
+
+        Output:
+            - Same candidate indices, reordered by ITM match probability.
+        """
     if not candidates:
         return candidates
 
@@ -333,6 +404,16 @@ def itm_rerank(proc, model, query_path: str, candidates: List[int], meta: List[C
 
 
 def load_clip(model_name: str, pretrained: str, device: str, weights_path: str):
+        """Load CLIP model (vision+text encoders) for embedding.
+
+        Model used:
+            - CLIP (OpenCLIP implementation)
+            - Optionally loads fine-tuned weights (clip_best.pt-style checkpoint)
+
+        Purpose:
+            - Encode images into embeddings for retrieval.
+            - Encode captions into embeddings for fusion.
+        """
     try:
         import open_clip
     except ImportError as exc:
@@ -349,6 +430,14 @@ def load_clip(model_name: str, pretrained: str, device: str, weights_path: str):
 
 
 def encode_images_batched(model, preprocess, img_paths: List[str], device: str, batch_size: int) -> np.ndarray:
+        """Encode images with CLIP image encoder in batches.
+
+        Model call:
+            - model.encode_image(...)
+
+        Output:
+            - (N, D) L2-normalized float32 numpy matrix.
+        """
     vecs = []
     use_amp = device.startswith("cuda")
     for i in tqdm(range(0, len(img_paths), batch_size), desc="image embed", leave=False):
@@ -366,6 +455,14 @@ def encode_images_batched(model, preprocess, img_paths: List[str], device: str, 
 
 
 def encode_texts_batched(model, tokenizer, captions: List[str], device: str, batch_size: int) -> np.ndarray:
+        """Encode text captions with CLIP text encoder in batches.
+
+        Model call:
+            - model.encode_text(...)
+
+        Output:
+            - (N, D) L2-normalized float32 numpy matrix.
+        """
     vecs = []
     use_amp = device.startswith("cuda")
     for i in tqdm(range(0, len(captions), batch_size), desc="text embed", leave=False):
@@ -382,6 +479,14 @@ def encode_texts_batched(model, tokenizer, captions: List[str], device: str, bat
 
 
 def build_hnsw(vectors: np.ndarray, m: int, ef: int, ef_construct: int):
+        """Build an HNSW approximate nearest-neighbor index.
+
+        Library/model used:
+            - hnswlib.Index(space="cosine")
+
+        Purpose:
+            - Fast retrieval of top-K nearest neighbors in embedding space.
+        """
     import hnswlib
     idx = hnswlib.Index(space="cosine", dim=vectors.shape[1])
     idx.init_index(max_elements=len(vectors), ef_construction=ef_construct, M=m)
@@ -502,6 +607,9 @@ def main() -> None:
 
     label_lookup = load_labels(args.labels_file)
 
+    # ------------------------------------------------------------------
+    # Model 1: YOLO detector (for cropping)
+    # ------------------------------------------------------------------
     yolo_model = None
     if not args.disable_crop:
         yolo_model = load_yolo(args.yolo_weights, device)
@@ -542,16 +650,23 @@ def main() -> None:
         if need_crop or need_caption:
             todo_paths.append(p)
 
+    # ------------------------------------------------------------------
+    # Model 2: BLIP-2 captioner (optional)
+    # ------------------------------------------------------------------
     blip_proc = None
     blip_model = None
     if use_blip2:
         print("Loading BLIP-2 for captions...")
         blip_proc, blip_model = load_blip2(args.blip2_model, device)
 
+    # Build a catalog that has (cropped_path, caption) per gallery image.
+    # This is an offline/precompute step to avoid repeatedly calling YOLO/BLIP.
     for i in tqdm(range(0, len(todo_paths), args.yolo_batch), desc="catalog build"):
         batch = todo_paths[i : i + args.yolo_batch]
+        # YOLO call: localize and crop each gallery image.
         crops = yolo_crop_batch(yolo_model, batch, crop_dir, args.crop_pad, device)
         if use_blip2:
+            # BLIP-2 call: generate captions from the cropped gallery images.
             captions = caption_batch(blip_proc, blip_model, crops, args.caption_batch, device, args.caption_max_tokens)
         else:
             captions = ["" for _ in crops]
@@ -577,6 +692,9 @@ def main() -> None:
 
     print(f"Catalog ready: {len(catalog)} items")
 
+    # ------------------------------------------------------------------
+    # Model 3: CLIP embedder (vision + text)
+    # ------------------------------------------------------------------
     clip_model, clip_preprocess, clip_tokenizer = load_clip(
         args.clip_model, args.clip_pretrain, device, args.clip_ft_weights
     )
@@ -591,12 +709,14 @@ def main() -> None:
     gallery_crops = [rec.cropped_path for rec in catalog]
     gallery_captions = [rec.caption for rec in catalog]
 
+    # Gallery image embeddings (CLIP image encoder). Cached for speed.
     if img_cache.exists():
         gal_img = np.load(img_cache)
     else:
         gal_img = encode_images_batched(clip_model, clip_preprocess, gallery_crops, device, args.embed_batch)
         np.save(img_cache, gal_img)
 
+    # Gallery text embeddings (CLIP text encoder) for caption fusion.
     if any(c for c in gallery_captions):
         if txt_cache.exists():
             gal_txt = np.load(txt_cache)
@@ -606,23 +726,33 @@ def main() -> None:
     else:
         gal_txt = np.zeros_like(gal_img)
 
+    # Query preprocessing: YOLO crop each query image.
     query_crops: List[str] = []
     for i in tqdm(range(0, len(query_paths), args.yolo_batch), desc="query crops"):
         batch = query_paths[i : i + args.yolo_batch]
         query_crops.extend(yolo_crop_batch(yolo_model, batch, crop_dir, args.crop_pad, device))
 
+    # Query embeddings (CLIP image encoder). Cached for repeatability.
     if q_cache.exists():
         q_img = np.load(q_cache)
     else:
         q_img = encode_images_batched(clip_model, clip_preprocess, query_crops, device, args.embed_batch)
         np.save(q_cache, q_img)
 
+    # ------------------------------------------------------------------
+    # Fusion: combine image and caption embeddings
+    #   fused = alpha * v + (1-alpha) * t
+    # ------------------------------------------------------------------
     fused = args.alpha * gal_img + (1.0 - args.alpha) * gal_txt
     norms = np.linalg.norm(fused, axis=1, keepdims=True).clip(min=1e-8)
     fused = (fused / norms).astype("float32")
 
+    # ------------------------------------------------------------------
+    # Retrieval backend: HNSW (approximate) or brute-force (exact)
+    # ------------------------------------------------------------------
     if args.index_backend == "hnsw":
         try:
+            # hnswlib index build (cosine space).
             index = build_hnsw(fused, args.hnsw_m, args.hnsw_ef, args.hnsw_ef_construct)
             use_hnsw = True
         except Exception as exc:
@@ -634,6 +764,9 @@ def main() -> None:
     if not use_hnsw:
         fused_t = fused.T
 
+    # ------------------------------------------------------------------
+    # Model 4: BLIP-ITM reranker (optional)
+    # ------------------------------------------------------------------
     itm_proc = None
     itm_model = None
     if use_itm:
@@ -651,16 +784,25 @@ def main() -> None:
 
     k_search = max(args.top_k, args.qual_top_k)
 
+    # ------------------------------------------------------------------
+    # Query-time flow (per query):
+    #   1) Take precomputed CLIP query embedding
+    #   2) Retrieve top-K via HNSW (or brute-force)
+    #   3) Optionally rerank via BLIP-ITM using candidate captions
+    # ------------------------------------------------------------------
     for qi in tqdm(range(len(query_paths)), desc="search"):
         qvec = q_img[qi].reshape(1, -1).astype("float32")
         if use_hnsw:
+            # ANN retrieval call: hnswlib.knn_query
             labels, _ = index.knn_query(qvec, k=k_search)
             candidates = list(labels[0])
         else:
+            # Exact retrieval call: dot-product over normalized vectors.
             scores = fused @ qvec.squeeze(0)
             candidates = list(np.argsort(-scores)[:k_search])
 
         if use_itm and itm_proc is not None and itm_model is not None:
+            # Reranker call: BLIP ITM image-text matching scores.
             candidates = itm_rerank(itm_proc, itm_model, query_crops[qi], candidates, catalog, device)
 
         ranked_indices.append(candidates)
